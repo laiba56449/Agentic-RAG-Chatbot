@@ -1,22 +1,29 @@
-from typing import List
 from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
+from typing import List
 
-from app.api.deps import get_current_user
-from app.core.utils import generate_invite_code, slugify
 from app.db.session import get_db
+from app.api.deps import (
+    get_current_user,
+    require_org_member,
+    require_org_admin,
+)
+from app.models.user import User
 from app.models.organization import Organization
 from app.models.organization_member import OrganizationMember, OrgRole
-from app.models.user import User
 from app.schemas.organization import (
     OrganizationCreate,
     OrganizationOut,
     OrganizationJoin,
     MembershipOut,
 )
+from app.core.utils import slugify, generate_invite_code
 
-router = APIRouter(prefix="/api/organizations", tags=["organizations"])
+
+router = APIRouter(
+    prefix="/api/organizations",
+    tags=["organizations"]
+)
 
 
 @router.post("", response_model=OrganizationOut, status_code=status.HTTP_201_CREATED)
@@ -26,6 +33,7 @@ def create_organization(
     current_user: User = Depends(get_current_user),
 ):
     base_slug = slugify(org_in.name)
+
     if not base_slug:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -34,6 +42,7 @@ def create_organization(
 
     slug = base_slug
     suffix = 1
+
     while db.query(Organization).filter(Organization.slug == slug).first():
         suffix += 1
         slug = f"{base_slug}-{suffix}"
@@ -43,6 +52,7 @@ def create_organization(
         slug=slug,
         invite_code=generate_invite_code(),
     )
+
     db.add(new_org)
     db.flush()
 
@@ -51,12 +61,15 @@ def create_organization(
         organization_id=new_org.id,
         role=OrgRole.admin,
     )
+
     db.add(membership)
 
     db.commit()
     db.refresh(new_org)
 
     return new_org
+
+
 @router.post("/join", response_model=OrganizationOut, status_code=status.HTTP_200_OK)
 def join_organization(
     join_in: OrganizationJoin,
@@ -75,6 +88,21 @@ def join_organization(
             detail="Invalid invite code",
         )
 
+    existing = (
+        db.query(OrganizationMember)
+        .filter(
+            OrganizationMember.user_id == current_user.id,
+            OrganizationMember.organization_id == org.id,
+        )
+        .first()
+    )
+
+    if existing:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="You are already a member of this organization",
+        )
+
     membership = OrganizationMember(
         user_id=current_user.id,
         organization_id=org.id,
@@ -83,16 +111,9 @@ def join_organization(
 
     db.add(membership)
 
-    try:
-        db.commit()
-    except IntegrityError:
-        db.rollback()
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="User is already a member of this organization",
-        )
-
+    db.commit()
     db.refresh(org)
+
     return org
 
 
@@ -106,5 +127,25 @@ def list_my_organizations(
         .filter(OrganizationMember.user_id == current_user.id)
         .all()
     )
+
     return memberships
 
+
+@router.get("/{org_id}/member-check")
+def member_check(
+    membership: OrganizationMember = Depends(require_org_member),
+):
+    return {
+        "organization_id": str(membership.organization_id),
+        "role": membership.role.value,
+    }
+
+
+@router.get("/{org_id}/admin-check")
+def admin_check(
+    membership: OrganizationMember = Depends(require_org_admin),
+):
+    return {
+        "organization_id": str(membership.organization_id),
+        "role": membership.role.value,
+    }
